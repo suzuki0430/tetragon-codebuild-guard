@@ -1,0 +1,9 @@
+{
+  "name": "victim-build",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal npm project that installs the safe compromised dependency fixture.",
+  "dependencies": {
+    "compromised-dependency": "file:../compromised-dependency"
+  }
+}

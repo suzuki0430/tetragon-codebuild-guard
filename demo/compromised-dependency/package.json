@@ -1,0 +1,9 @@
+{
+  "name": "compromised-dependency",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Safe local package used to simulate a compromised lifecycle script.",
+  "scripts": {
+    "postinstall": "node postinstall.mjs"
+  }
+}
