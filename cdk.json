@@ -1,0 +1,8 @@
+{
+  "app": "pnpm exec ts-node --prefer-ts-exts bin/app.ts",
+  "context": {
+    "githubOwner": "replace-me",
+    "githubRepo": "tetragon-codebuild-guard",
+    "@aws-cdk/aws-iam:minimizePolicies": true
+  }
+}

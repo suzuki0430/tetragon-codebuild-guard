@@ -1,0 +1,7 @@
+node_modules/
+cdk.out/
+coverage/
+dist/
+guard-artifacts/
+.DS_Store
+*.log

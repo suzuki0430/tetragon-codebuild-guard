@@ -1,0 +1,113 @@
+name: Tetragon CodeBuild Guard
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard-demo:
+    name: ${{ matrix.mode }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - baseline
+          - observe
+          - enforce
+    runs-on:
+      - codebuild-tetragon-codebuild-guard-${{ github.run_id }}-${{ github.run_attempt }}
+      - buildspec-override:true
+      - tetragon-${{ matrix.mode }}
+    env:
+      DEMO_MODE: ${{ matrix.mode }}
+      RESULT_DIR: guard-artifacts/${{ matrix.mode }}
+      TETRAGON_ARTIFACT_DIR: /tmp/tetragon-codebuild-guard
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Verify Tetragon startup
+        run: ./scripts/tetragon-guard.sh status
+
+      - name: Configure the tracing policy
+        run: ./scripts/tetragon-guard.sh apply "${DEMO_MODE}"
+
+      - name: Start the local canary sink
+        run: |
+          set -euo pipefail
+          mkdir -p "${RESULT_DIR}"
+          receipt_path="${RUNNER_TEMP}/canary-receipt-${DEMO_MODE}.json"
+          ready_path="${RUNNER_TEMP}/canary-ready-${DEMO_MODE}"
+          rm -f "${receipt_path}" "${ready_path}"
+          node scripts/canary-server.mjs \
+            --port 18080 \
+            --ready "${ready_path}" \
+            --receipt "${receipt_path}" \
+            > "${RESULT_DIR}/canary-server.log" 2>&1 &
+          printf '%s\n' "$!" > "${RUNNER_TEMP}/canary-server.pid"
+          for attempt in $(seq 1 20); do
+            if [[ -f "${ready_path}" ]]; then
+              break
+            fi
+            sleep 0.25
+          done
+          test -f "${ready_path}"
+          container_ip="$(hostname -I | awk '{print $1}')"
+          test -n "${container_ip}"
+          printf 'CANARY_RECEIPT=%s\n' "${receipt_path}" >> "${GITHUB_ENV}"
+          printf 'CANARY_SINK_URL=http://%s:18080/collect\n' "${container_ip}" >> "${GITHUB_ENV}"
+
+      - name: Install the simulated compromised dependency
+        id: attack
+        continue-on-error: true
+        env:
+          CI_CANARY_SECRET: tetragon-demo-only-not-a-secret
+        run: |
+          set -euo pipefail
+          npm ci \
+            --prefix demo/victim \
+            --offline \
+            --no-audit \
+            --no-fund
+
+      - name: Collect Tetragon evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          sleep 1
+          ./scripts/tetragon-guard.sh capture "${RESULT_DIR}"
+          node scripts/analyze-events.mjs \
+            "${RESULT_DIR}/tetragon.log" \
+            --output "${RESULT_DIR}/summary.json"
+          cat "${RESULT_DIR}/summary.json"
+
+      - name: Assert the expected security result
+        if: always()
+        env:
+          ATTACK_OUTCOME: ${{ steps.attack.outcome }}
+        run: |
+          node scripts/assert-demo-result.mjs \
+            --mode "${DEMO_MODE}" \
+            --attack-outcome "${ATTACK_OUTCOME}" \
+            --receipt "${CANARY_RECEIPT}" \
+            --summary "${RESULT_DIR}/summary.json"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tetragon-${{ matrix.mode }}
+          path: guard-artifacts/${{ matrix.mode }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Stop the canary sink
+        if: always()
+        run: |
+          if [[ -f "${RUNNER_TEMP}/canary-server.pid" ]]; then
+            kill "$(cat "${RUNNER_TEMP}/canary-server.pid")" 2>/dev/null || true
+          fi
