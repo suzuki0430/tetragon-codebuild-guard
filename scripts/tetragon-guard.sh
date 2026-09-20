@@ -84,6 +84,7 @@ capture_artifacts() {
   sync
   cp "${TETRAGON_DATA_DIR}/startup-status" "${destination}/" 2>/dev/null || true
   cp "${TETRAGON_DATA_DIR}/startup-error.log" "${destination}/" 2>/dev/null || true
+  cp "${TETRAGON_DATA_DIR}/kernel-diagnostics.txt" "${destination}/" 2>/dev/null || true
   cp "${TETRAGON_DATA_DIR}/tetragon.log" "${destination}/" 2>/dev/null || true
   docker logs "${TETRAGON_CONTAINER_NAME}" > "${destination}/tetragon-daemon.log" 2>&1 || true
   docker exec "${TETRAGON_CONTAINER_NAME}" tetra tracingpolicy list \

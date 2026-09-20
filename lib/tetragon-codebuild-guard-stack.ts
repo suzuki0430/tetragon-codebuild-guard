@@ -144,6 +144,8 @@ export class TetragonCodeBuildGuardStack extends Stack {
     });
 
     const cfnProject = this.runnerProject.node.defaultChild as codebuild.CfnProject;
+    // The build image selects userspace only; eBPF/BTF needs a modern host kernel.
+    cfnProject.addPropertyOverride('Environment.HostKernel', 'LINUX_KERNEL_6');
     cfnProject.addPropertyOverride('Triggers.FilterGroups', [
       [
         { Pattern: 'WORKFLOW_JOB_QUEUED', Type: 'EVENT' },

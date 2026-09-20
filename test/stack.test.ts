@@ -33,6 +33,7 @@ describe('TetragonCodeBuildGuardStack', () => {
       Environment: Match.objectLike({
         ComputeType: 'BUILD_GENERAL1_MEDIUM',
         Image: 'aws/codebuild/amazonlinux-x86_64-standard:5.0',
+        HostKernel: 'LINUX_KERNEL_6',
         PrivilegedMode: true,
         Type: 'LINUX_CONTAINER',
       }),
@@ -76,6 +77,18 @@ describe('TetragonCodeBuildGuardStack', () => {
     // v1.7.0 has no boolean ancestor flag; base enables kprobe reference counting.
     expect(buildSpec.asString()).toContain('--enable-ancestors=base,kprobe');
     expect(buildSpec.asString()).not.toContain('--enable-process-ancestors');
+  });
+
+  it('keeps failed containers for diagnostics until post-build cleanup', () => {
+    const buildSpec = new Capture();
+    synthesizeTemplate().hasResourceProperties('AWS::CodeBuild::Project', {
+      Source: Match.objectLike({ BuildSpec: buildSpec }),
+    });
+
+    expect(buildSpec.asString()).toContain('kernel-diagnostics.txt');
+    expect(buildSpec.asString()).toContain('uname -srvm');
+    expect(buildSpec.asString()).toContain('docker run --name tetragon -d');
+    expect(buildSpec.asString()).not.toContain('docker run --name tetragon --rm');
   });
 
   it('uses a CodeConnections ARN and grants only connection token access', () => {
