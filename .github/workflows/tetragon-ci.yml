@@ -56,7 +56,7 @@ jobs:
             sleep 0.25
           done
           test -f "${ready_path}"
-          container_ip="$(hostname -I | awk '{print $1}')"
+          container_ip="$(node scripts/local-ipv4.mjs)"
           test -n "${container_ip}"
           printf 'CANARY_RECEIPT=%s\n' "${receipt_path}" >> "${GITHUB_ENV}"
           printf 'CANARY_SINK_URL=http://%s:18080/collect\n' "${container_ip}" >> "${GITHUB_ENV}"
@@ -68,6 +68,7 @@ jobs:
           CI_CANARY_SECRET: tetragon-demo-only-not-a-secret
         run: |
           set -euo pipefail
+          export CANARY_ATTACK_RESULT="${GITHUB_WORKSPACE}/${RESULT_DIR}/attack-result.json"
           npm ci \
             --prefix demo/victim \
             --offline \
@@ -80,13 +81,16 @@ jobs:
           set -euo pipefail
           sleep 1
           ./scripts/tetragon-guard.sh capture "${RESULT_DIR}"
+          if [[ -n "${CANARY_RECEIPT:-}" && -f "${CANARY_RECEIPT}" ]]; then
+            cp "${CANARY_RECEIPT}" "${RESULT_DIR}/canary-receipt.json"
+          fi
           node scripts/analyze-events.mjs \
             "${RESULT_DIR}/tetragon.log" \
             --output "${RESULT_DIR}/summary.json"
           cat "${RESULT_DIR}/summary.json"
 
       - name: Assert the expected security result
-        if: always()
+        if: always() && (steps.attack.outcome == 'success' || steps.attack.outcome == 'failure')
         env:
           ATTACK_OUTCOME: ${{ steps.attack.outcome }}
         run: |
@@ -94,7 +98,10 @@ jobs:
             --mode "${DEMO_MODE}" \
             --attack-outcome "${ATTACK_OUTCOME}" \
             --receipt "${CANARY_RECEIPT}" \
-            --summary "${RESULT_DIR}/summary.json"
+            --summary "${RESULT_DIR}/summary.json" \
+            --attack-result "${RESULT_DIR}/attack-result.json" \
+            --sink-url "${CANARY_SINK_URL}" \
+            --output "${RESULT_DIR}/result.json"
 
       - name: Upload evidence
         if: always()

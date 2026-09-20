@@ -73,8 +73,12 @@ function socketArgument(kprobe) {
  *   processExecCount: number,
  *   tcpConnectCount: number,
  *   curlTcpConnectCount: number,
- *   enforcedCurlConnectCount: number,
- *   curlDestinations: string[]
+ *   curlSigkillActionCount: number,
+ *   curlDestinations: string[],
+ *   policyTcpConnectCount: number,
+ *   policyConnectMissingBinaryCount: number,
+ *   policySigkillActionCount: number,
+ *   policyDestinations: string[]
  * }} Aggregated event counts and unique curl destinations.
  *
  * @example
@@ -85,8 +89,12 @@ export function summarizeTetragonEvents(events, invalidLineCount = 0) {
   let processExecCount = 0;
   let tcpConnectCount = 0;
   let curlTcpConnectCount = 0;
-  let enforcedCurlConnectCount = 0;
+  let curlSigkillActionCount = 0;
+  let policyTcpConnectCount = 0;
+  let policyConnectMissingBinaryCount = 0;
+  let policySigkillActionCount = 0;
   const curlDestinations = new Set();
+  const policyDestinations = new Set();
 
   for (const event of events) {
     if (event.process_exec !== undefined) {
@@ -105,21 +113,40 @@ export function summarizeTetragonEvents(events, invalidLineCount = 0) {
     const process = kprobe.process;
     const binary =
       process !== null && typeof process === 'object' ? process.binary : undefined;
+    const socket = socketArgument(kprobe);
+    const destination =
+      socket !== undefined && typeof socket.daddr === 'string'
+        ? typeof socket.dport === 'number'
+          ? `${socket.daddr}:${socket.dport}`
+          : socket.daddr
+        : undefined;
+    const sigkillAction =
+      kprobe.action === 'KPROBE_ACTION_SIGKILL' || kprobe.action === 3;
+
+    // Kernel-side binary matching can succeed even when userspace enrichment fails.
+    // Keep policy matches separate; never invent a missing process.binary value.
+    if (kprobe.policy_name === 'block-curl-egress') {
+      policyTcpConnectCount += 1;
+      if (typeof binary !== 'string' || binary.length === 0) {
+        policyConnectMissingBinaryCount += 1;
+      }
+      if (sigkillAction) {
+        policySigkillActionCount += 1;
+      }
+      if (destination !== undefined) {
+        policyDestinations.add(destination);
+      }
+    }
     if (binary !== '/usr/bin/curl') {
       continue;
     }
 
     curlTcpConnectCount += 1;
-    if (kprobe.action === 'KPROBE_ACTION_SIGKILL' || kprobe.action === 3) {
-      enforcedCurlConnectCount += 1;
+    if (sigkillAction) {
+      curlSigkillActionCount += 1;
     }
 
-    const socket = socketArgument(kprobe);
-    if (socket !== undefined && typeof socket.daddr === 'string') {
-      const destination =
-        typeof socket.dport === 'number'
-          ? `${socket.daddr}:${socket.dport}`
-          : socket.daddr;
+    if (destination !== undefined) {
       curlDestinations.add(destination);
     }
   }
@@ -130,8 +157,13 @@ export function summarizeTetragonEvents(events, invalidLineCount = 0) {
     processExecCount,
     tcpConnectCount,
     curlTcpConnectCount,
-    enforcedCurlConnectCount,
+    curlSigkillActionCount,
     curlDestinations: [...curlDestinations].sort(),
+    policyTcpConnectCount,
+    policyConnectMissingBinaryCount,
+    // A SIGKILL action label also appears in monitor mode; it is not proof of a kill.
+    policySigkillActionCount,
+    policyDestinations: [...policyDestinations].sort(),
   };
 }
 

@@ -17,11 +17,11 @@ TetragonはCVEを列挙する脆弱性スキャナーではありません。こ
 
 同じ安全な攻撃シナリオを、次の3モードで実行します。
 
-| モード     | TracingPolicy | npm lifecycle script | Canary受信 | 期待するTetragonイベント |
-| ---------- | ------------- | -------------------- | ---------- | ------------------------ |
-| `baseline` | 未適用        | 成功                 | あり       | `tcp_connect`なし        |
-| `observe`  | monitor       | 成功                 | あり       | curlの`tcp_connect`あり  |
-| `enforce`  | enforce       | SIGKILLで失敗        | なし       | curlの`tcp_connect`あり  |
+| モード     | TracingPolicy | npm lifecycle script | Canary受信 | 期待するTetragonイベント     |
+| ---------- | ------------- | -------------------- | ---------- | ---------------------------- |
+| `baseline` | 未適用        | 成功                 | あり       | `tcp_connect`なし            |
+| `observe`  | monitor       | 成功                 | あり       | 対象policyの接続イベントあり |
+| `enforce`  | enforce       | SIGKILLで失敗        | なし       | 対象policyの接続イベントあり |
 
 `demo/compromised-dependency`の`postinstall`は、固定文字列のcanaryを`curl`で送信します。
 送信先はCodeBuildコンテナ内で起動する一時HTTPサーバーです。実在する認証情報や
@@ -47,6 +47,10 @@ CodeBuildの`PRE_BUILD`でTetragonを起動し、GitHub Actions runnerが動く`
 観測を開始します。`POST_BUILD`ではデーモンログを回収してTetragonを停止します。
 この挙動を有効にするため、workflowのrunner labelには`buildspec-override:true`が必要です。
 
+ビルドイメージとホストカーネルは別設定です。このStackでは、AL2023のビルドイメージに加えて
+`Environment.HostKernel: LINUX_KERNEL_6`を明示します。AL2023のイメージだけを選んでも
+Linux 4.14のホストで起動する場合があり、Tetragonが必要とするBTFを利用できません。
+
 ## 作成されるAWSリソース
 
 - CodeBuild project `tetragon-codebuild-guard`
@@ -62,7 +66,7 @@ VPC、NAT Gateway、EKS、S3 bucketは作成しません。
 
 - AWSアカウントとデプロイ権限
 - Node.js 22以降
-- pnpm 11
+- pnpm 10.11.0（`package.json`の`packageManager`と一致させる）
 - AWS CLI
 - GitHub repository
 - 対象リージョンで`CDK bootstrap`済みであること
@@ -90,6 +94,14 @@ aws codeconnections create-connection \
 ```
 
 返されたARNを控えます。`PENDING`のままではデプロイ後のwebhook作成に失敗します。
+
+GitHub Appの**認可（Authorize）とインストール（Install）は別の手順**です。
+`AVAILABLE`でもApp未インストールの場合、Webhookは作成できません。
+
+1. [AWS Connector for GitHub](https://github.com/apps/aws-connector-for-github)をインストールする。
+2. `Only select repositories`で検証用リポジトリだけを許可する。
+3. GitHubの`Settings > Applications > Installed GitHub Apps`にAppがあることを確認する。
+4. 接続の作成時は対象のApp installationを選択し、AWS側が`AVAILABLE`になったことを確認する。
 
 ### 3. 依存関係とCDK templateを検証する
 
@@ -133,8 +145,12 @@ gh workflow run tetragon-ci.yml
 - `tetragon.log`: TetragonのNDJSONイベント
 - `summary.json`: secretを含まない集計結果
 - `tetragon-daemon.log`: Tetragonの起動・診断ログ
+- `kernel-diagnostics.txt`: 実際のカーネルバージョン、BTFの有無、Dockerのホスト情報
 - `tracing-policies.txt`: 適用されたpolicyとmode
 - `canary-server.log`: ローカル受信サーバーのログ
+- `attack-result.json`: curl子プロセスの終了コードとsignal
+- `canary-receipt.json`: 受信した場合のみ保存するcanaryのSHA-256
+- `result.json`: ポリシーの接続先、curl終了結果、受信有無を突き合わせた判定
 
 `observe`の`summary.json`例:
 
@@ -144,14 +160,27 @@ gh workflow run tetragon-ci.yml
   "invalidLineCount": 0,
   "processExecCount": 30,
   "tcpConnectCount": 1,
-  "curlTcpConnectCount": 1,
-  "enforcedCurlConnectCount": 0,
-  "curlDestinations": ["172.18.0.1:18080"]
+  "curlTcpConnectCount": 0,
+  "curlSigkillActionCount": 0,
+  "curlDestinations": [],
+  "policyTcpConnectCount": 1,
+  "policyConnectMissingBinaryCount": 1,
+  "policySigkillActionCount": 1,
+  "policyDestinations": ["172.18.0.1:18080"]
 }
 ```
 
 カーネルやTetragonのバージョンによって総イベント数やaction表現は変わる可能性があります。
-workflowの成否判定に使用するのは、curlのイベント有無、npm stepの結果、canary受信の有無です。
+workflowの成否判定に使用するのは、対象policyの送信先に一致する接続イベント、npm stepの結果、
+curl子プロセスの実際のsignal、canary受信の有無です。単なる通信エラーはenforce成功とみなしません。
+
+CodeBuild実測では、policyがカーネル内で`/usr/bin/curl`に一致していても、イベントの
+`process.binary`が欠け、`flags: unknown`になることがありました。これをcurl名で補完せず、
+`policyConnectMissingBinaryCount`として明示します。プロセスの親子関係まで取得できたとは主張しません。
+
+またmonitorモードでもイベントのactionは`KPROBE_ACTION_SIGKILL`になり得ます。
+actionラベルだけで遮断と判定せず、`attack-result.json`の`signal: SIGKILL`と未受信を要求します。
+この区別のため、初期PoCの`enforcedCurlConnectCount`は`curlSigkillActionCount`へ改名しました。
 
 ## 実装のポイント
 
@@ -177,8 +206,10 @@ Tetragonの生ログにはプロセス引数が含まれ得ます。`summary.jso
 
 ### `btf-unavailable`
 
-CodeBuild環境で`/sys/kernel/btf/vmlinux`が公開されていません。別のCodeBuildイメージを試すか、
-Amazon Linux 2023のEC2セルフホステッドrunnerへ切り替えてください。
+CodeBuild環境で`/sys/kernel/btf/vmlinux`が公開されていません。まず
+`kernel-diagnostics.txt`とCodeBuild projectの`environment.hostKernel`を確認してください。
+`LINUX_KERNEL_6`が必要で、ビルドイメージだけを変更してもホストカーネルは変わりません。
+指定済みでもBTFがない場合は、診断ログを保存して対応環境を再検討してください。
 
 ### `container-start-failed`
 
@@ -188,6 +219,15 @@ CodeBuild projectの`PrivilegedMode`、Docker daemon、Quayへの外向き通信
 ### `readiness-timeout`
 
 `tetragon-daemon.log`でBPF program、BTF、kernel capabilityのエラーを確認してください。
+起動に失敗したコンテナも`POST_BUILD`まで保持するため、終了理由を回収できます。
+
+### Webhook作成時の権限エラー
+
+CodeConnectionsが`AVAILABLE`でも、GitHub Appが未インストール・対象リポジトリ未許可・
+追加Webhook権限の承認待ちの場合があります。GitHubの`Installed GitHub Apps`を確認し、
+必要ならAppの権限更新を承認してください。
+[AWS公式のトラブルシューティング](https://docs.aws.amazon.com/codebuild/latest/userguide/connections-github-app.html)
+も参照してください。
 
 ### GitHub jobがrunner待ちのままになる
 

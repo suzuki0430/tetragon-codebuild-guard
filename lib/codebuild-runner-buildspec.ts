@@ -9,6 +9,12 @@ chmod 0777 "${TETRAGON_ARTIFACT_DIR}"
 status_file="${TETRAGON_ARTIFACT_DIR}/startup-status"
 : > "${TETRAGON_ARTIFACT_DIR}/tetragon.log"
 chmod 0666 "${TETRAGON_ARTIFACT_DIR}/tetragon.log"
+{
+  uname -srvm
+  ls -ld /sys/kernel/btf /sys/kernel/btf/vmlinux
+  docker info --format '{{.KernelVersion}} {{.OperatingSystem}}'
+} > "${TETRAGON_ARTIFACT_DIR}/kernel-diagnostics.txt" 2>&1
+cat "${TETRAGON_ARTIFACT_DIR}/kernel-diagnostics.txt"
 
 if [ ! -r /sys/kernel/btf/vmlinux ]; then
   printf '%s\n' 'btf-unavailable' > "$status_file"
@@ -17,14 +23,14 @@ if [ ! -r /sys/kernel/btf/vmlinux ]; then
 fi
 
 docker rm -f tetragon >/dev/null 2>&1 || true
-docker run --name tetragon --rm -d \
+docker run --name tetragon -d \
   --pid=host \
   --cgroupns=host \
   --privileged \
+  --entrypoint /usr/bin/tetragon \
   -v /sys/kernel/btf/vmlinux:/var/lib/tetragon/btf:ro \
   -v "${TETRAGON_ARTIFACT_DIR}:/var/log/tetragon" \
   "$TETRAGON_IMAGE" \
-  /usr/bin/tetragon \
   --export-filename /var/log/tetragon/tetragon.log \
   --enable-ancestors=base,kprobe > "${TETRAGON_ARTIFACT_DIR}/container-id" 2> "${TETRAGON_ARTIFACT_DIR}/startup-error.log"
 
@@ -80,6 +86,9 @@ export function createCodeBuildRunnerBuildSpec(): codebuild.BuildSpec {
   return codebuild.BuildSpec.fromObjectToYaml({
     version: '0.2',
     phases: {
+      install: {
+        'runtime-versions': { nodejs: 22 },
+      },
       pre_build: {
         commands: [START_TETRAGON],
       },

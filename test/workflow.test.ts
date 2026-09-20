@@ -6,6 +6,9 @@ import { parse } from 'yaml';
 
 interface WorkflowStep {
   readonly uses?: string;
+  readonly name?: string;
+  readonly run?: string;
+  readonly if?: string;
 }
 
 interface GuardWorkflow {
@@ -45,5 +48,21 @@ describe('GitHub Actions workflow', () => {
     for (const action of externalActions) {
       expect(action).toMatch(/^[^@]+@[a-f0-9]{40}$/);
     }
+  });
+
+  it('uses the portable local address helper and skips assertions after setup failures', () => {
+    const workflow = parse(
+      readFileSync(resolve('.github/workflows/tetragon-ci.yml'), 'utf8'),
+    ) as GuardWorkflow;
+    const steps = workflow.jobs['guard-demo'].steps;
+    const sink = steps.find((step) => step.name === 'Start the local canary sink');
+    const assertion = steps.find(
+      (step) => step.name === 'Assert the expected security result',
+    );
+
+    expect(sink?.run).toContain('node scripts/local-ipv4.mjs');
+    expect(sink?.run).not.toContain('hostname');
+    expect(assertion?.if).toContain("steps.attack.outcome == 'success'");
+    expect(assertion?.if).toContain("steps.attack.outcome == 'failure'");
   });
 });

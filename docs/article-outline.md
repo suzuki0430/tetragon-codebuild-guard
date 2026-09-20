@@ -13,7 +13,7 @@ AWS CodeBuild上のGitHub ActionsをTetragonで監視し、悪意あるnpm posti
 
 ## 構成案
 
-1. KubeCon Japanで見た「Detecting Compromised CI」の問題設定
+1. KubeConで聞いたCIランタイム監視の問題設定
 2. なぜGitHub-hosted runnerではなくAWS CodeBuild-hosted runnerなのか
 3. Tetragon、CodeBuildログ、CloudTrail、VPC Flow Logsの観測範囲の違い
 4. 実験の安全設計
@@ -29,14 +29,17 @@ AWS CodeBuild上のGitHub ActionsをTetragonで監視し、悪意あるnpm posti
 
 ## 掲載する結果表
 
-| モード   | npm install | curl event | SIGKILL | Canary到達 |
-| -------- | ----------- | ---------- | ------- | ---------- |
-| baseline |             |            |         |            |
-| observe  |             |            |         |            |
-| enforce  |             |            |         |            |
+| モード   | npm install | policy接続event | 実際のSIGKILL | Canary到達 |
+| -------- | ----------- | --------------- | ------------- | ---------- |
+| baseline | 成功        | 0               | なし          | あり       |
+| observe  | 成功        | 1               | なし          | あり       |
+| enforce  | 失敗        | 1               | あり          | なし       |
 
-workflow artifactの実測値で空欄を埋める。CodeBuildのリージョン、イメージ、Tetragon、
-Linux kernelのバージョンも併記する。
+2026-09-20にAWS東京リージョンで実測済み。
+[検証結果と証拠へのリンク](aws-validation-2026-09-20.md)を参照する。
+AL2023イメージとは別に`HostKernel: LINUX_KERNEL_6`が必要だった点を記事の中心に置く。
+イベントの`process.binary`が欠落した点、monitorでもSIGKILLのactionラベルが出た点も明記し、
+policyイベントとcurl自身のsignal、受信結果をどう照合したか説明する。
 
 ## 必ず触れる制限
 

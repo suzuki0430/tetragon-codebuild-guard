@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 const SUPPORTED_MODES = new Set(['baseline', 'observe', 'enforce']);
@@ -11,7 +11,9 @@ const SUPPORTED_MODES = new Set(['baseline', 'observe', 'enforce']);
  *   mode: 'baseline' | 'observe' | 'enforce',
  *   attackOutcome: 'success' | 'failure',
  *   receiptExists: boolean,
- *   curlEventCount: number
+ *   policyEventCount: number,
+ *   destinationMatched: boolean,
+ *   attackSignal: string | null
  * }} result Observed workflow, canary, and Tetragon state.
  * @returns {{ok: boolean, reasons: string[]}} Pass/fail decision with actionable reasons.
  *
@@ -20,7 +22,9 @@ const SUPPORTED_MODES = new Set(['baseline', 'observe', 'enforce']);
  *   mode: 'enforce',
  *   attackOutcome: 'failure',
  *   receiptExists: false,
- *   curlEventCount: 1,
+ *   policyEventCount: 1,
+ *   destinationMatched: true,
+ *   attackSignal: 'SIGKILL',
  * });
  * console.log(result.ok); // true
  */
@@ -28,14 +32,20 @@ export function evaluateDemoResult(result) {
   const reasons = [];
   const protectedMode = result.mode === 'observe' || result.mode === 'enforce';
 
-  if (protectedMode && result.curlEventCount < 1) {
-    reasons.push('Tetragon did not record the expected curl tcp_connect event.');
+  if (!Number.isSafeInteger(result.policyEventCount) || result.policyEventCount < 0) {
+    reasons.push('The policy event count is missing or invalid.');
   }
-  if (result.mode === 'baseline' && result.curlEventCount !== 0) {
+  if (protectedMode && (result.policyEventCount < 1 || !result.destinationMatched)) {
+    reasons.push('The demo policy did not record a tcp_connect to the canary sink.');
+  }
+  if (result.mode === 'baseline' && result.policyEventCount !== 0) {
     reasons.push('Baseline unexpectedly loaded a tcp_connect tracing policy.');
   }
 
   if (result.mode === 'enforce') {
+    if (result.attackSignal !== 'SIGKILL') {
+      reasons.push('The curl child process did not report SIGKILL.');
+    }
     if (result.attackOutcome !== 'failure') {
       reasons.push('The simulated compromised dependency was not terminated.');
     }
@@ -58,7 +68,8 @@ export function evaluateDemoResult(result) {
  * Parses the assertion command-line options.
  *
  * @param {string[]} arguments_ Arguments excluding the Node executable and script path.
- * @returns {{mode: string, attackOutcome: string, receiptPath: string, summaryPath: string}}
+ * @returns {{mode: string, attackOutcome: string, receiptPath: string, summaryPath: string,
+ * attackResultPath: string, sinkUrl: string, outputPath?: string}}
  * Validated named options.
  */
 function parseArguments(arguments_) {
@@ -76,19 +87,32 @@ function parseArguments(arguments_) {
   const attackOutcome = options.get('attack-outcome');
   const receiptPath = options.get('receipt');
   const summaryPath = options.get('summary');
+  const attackResultPath = options.get('attack-result');
+  const sinkUrl = options.get('sink-url');
+  const outputPath = options.get('output');
   if (
     mode === undefined ||
     !SUPPORTED_MODES.has(mode) ||
     (attackOutcome !== 'success' && attackOutcome !== 'failure') ||
     receiptPath === undefined ||
-    summaryPath === undefined
+    summaryPath === undefined ||
+    attackResultPath === undefined ||
+    sinkUrl === undefined
   ) {
     throw new Error(
-      'Usage: assert-demo-result.mjs --mode <mode> --attack-outcome <success|failure> --receipt <path> --summary <path>',
+      'Usage: assert-demo-result.mjs --mode <mode> --attack-outcome <success|failure> --receipt <path> --summary <path> --attack-result <path> --sink-url <url> [--output <path>]',
     );
   }
 
-  return { mode, attackOutcome, receiptPath, summaryPath };
+  return {
+    mode,
+    attackOutcome,
+    receiptPath,
+    summaryPath,
+    attackResultPath,
+    sinkUrl,
+    outputPath,
+  };
 }
 
 /**
@@ -100,12 +124,24 @@ function parseArguments(arguments_) {
 function main(arguments_) {
   const options = parseArguments(arguments_);
   const summary = JSON.parse(readFileSync(options.summaryPath, 'utf8'));
-  const result = evaluateDemoResult({
+  const attack = JSON.parse(readFileSync(options.attackResultPath, 'utf8'));
+  const evidence = {
     mode: options.mode,
     attackOutcome: options.attackOutcome,
     receiptExists: existsSync(options.receiptPath),
-    curlEventCount: summary.curlTcpConnectCount,
-  });
+    policyEventCount: summary.policyTcpConnectCount,
+    destinationMatched: summary.policyDestinations.includes(
+      new URL(options.sinkUrl).host,
+    ),
+    attackSignal: attack.signal,
+  };
+  const result = evaluateDemoResult(evidence);
+  if (options.outputPath !== undefined) {
+    writeFileSync(
+      options.outputPath,
+      `${JSON.stringify({ ...evidence, ...result }, null, 2)}\n`,
+    );
+  }
 
   if (!result.ok) {
     for (const reason of result.reasons) {
