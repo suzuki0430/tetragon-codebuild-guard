@@ -86,6 +86,9 @@ export function createCodeBuildRunnerBuildSpec(): codebuild.BuildSpec {
   return codebuild.BuildSpec.fromObjectToYaml({
     version: '0.2',
     phases: {
+      install: {
+        'runtime-versions': { nodejs: 22 },
+      },
       pre_build: {
         commands: [START_TETRAGON],
       },

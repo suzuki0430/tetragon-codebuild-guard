@@ -47,6 +47,10 @@ CodeBuildの`PRE_BUILD`でTetragonを起動し、GitHub Actions runnerが動く`
 観測を開始します。`POST_BUILD`ではデーモンログを回収してTetragonを停止します。
 この挙動を有効にするため、workflowのrunner labelには`buildspec-override:true`が必要です。
 
+ビルドイメージとホストカーネルは別設定です。このStackでは、AL2023のビルドイメージに加えて
+`Environment.HostKernel: LINUX_KERNEL_6`を明示します。AL2023のイメージだけを選んでも
+Linux 4.14のホストで起動する場合があり、Tetragonが必要とするBTFを利用できません。
+
 ## 作成されるAWSリソース
 
 - CodeBuild project `tetragon-codebuild-guard`
@@ -62,7 +66,7 @@ VPC、NAT Gateway、EKS、S3 bucketは作成しません。
 
 - AWSアカウントとデプロイ権限
 - Node.js 22以降
-- pnpm 11
+- pnpm 10.11.0（`package.json`の`packageManager`と一致させる）
 - AWS CLI
 - GitHub repository
 - 対象リージョンで`CDK bootstrap`済みであること
@@ -90,6 +94,14 @@ aws codeconnections create-connection \
 ```
 
 返されたARNを控えます。`PENDING`のままではデプロイ後のwebhook作成に失敗します。
+
+GitHub Appの**認可（Authorize）とインストール（Install）は別の手順**です。
+`AVAILABLE`でもApp未インストールの場合、Webhookは作成できません。
+
+1. [AWS Connector for GitHub](https://github.com/apps/aws-connector-for-github)をインストールする。
+2. `Only select repositories`で検証用リポジトリだけを許可する。
+3. GitHubの`Settings > Applications > Installed GitHub Apps`にAppがあることを確認する。
+4. 接続の作成時は対象のApp installationを選択し、AWS側が`AVAILABLE`になったことを確認する。
 
 ### 3. 依存関係とCDK templateを検証する
 
@@ -133,6 +145,7 @@ gh workflow run tetragon-ci.yml
 - `tetragon.log`: TetragonのNDJSONイベント
 - `summary.json`: secretを含まない集計結果
 - `tetragon-daemon.log`: Tetragonの起動・診断ログ
+- `kernel-diagnostics.txt`: 実際のカーネルバージョン、BTFの有無、Dockerのホスト情報
 - `tracing-policies.txt`: 適用されたpolicyとmode
 - `canary-server.log`: ローカル受信サーバーのログ
 
@@ -177,8 +190,10 @@ Tetragonの生ログにはプロセス引数が含まれ得ます。`summary.jso
 
 ### `btf-unavailable`
 
-CodeBuild環境で`/sys/kernel/btf/vmlinux`が公開されていません。別のCodeBuildイメージを試すか、
-Amazon Linux 2023のEC2セルフホステッドrunnerへ切り替えてください。
+CodeBuild環境で`/sys/kernel/btf/vmlinux`が公開されていません。まず
+`kernel-diagnostics.txt`とCodeBuild projectの`environment.hostKernel`を確認してください。
+`LINUX_KERNEL_6`が必要で、ビルドイメージだけを変更してもホストカーネルは変わりません。
+指定済みでもBTFがない場合は、診断ログを保存して対応環境を再検討してください。
 
 ### `container-start-failed`
 
@@ -188,6 +203,15 @@ CodeBuild projectの`PrivilegedMode`、Docker daemon、Quayへの外向き通信
 ### `readiness-timeout`
 
 `tetragon-daemon.log`でBPF program、BTF、kernel capabilityのエラーを確認してください。
+起動に失敗したコンテナも`POST_BUILD`まで保持するため、終了理由を回収できます。
+
+### Webhook作成時の権限エラー
+
+CodeConnectionsが`AVAILABLE`でも、GitHub Appが未インストール・対象リポジトリ未許可・
+追加Webhook権限の承認待ちの場合があります。GitHubの`Installed GitHub Apps`を確認し、
+必要ならAppの権限更新を承認してください。
+[AWS公式のトラブルシューティング](https://docs.aws.amazon.com/codebuild/latest/userguide/connections-github-app.html)
+も参照してください。
 
 ### GitHub jobがrunner待ちのままになる
 

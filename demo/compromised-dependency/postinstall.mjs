@@ -26,6 +26,8 @@ function main() {
       '--show-error',
       '--max-time',
       '5',
+      '--noproxy',
+      '*',
       '--request',
       'POST',
       '--data-urlencode',
