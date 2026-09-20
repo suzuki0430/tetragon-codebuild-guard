@@ -88,6 +88,8 @@ describe('TetragonCodeBuildGuardStack', () => {
     expect(buildSpec.asString()).toContain('kernel-diagnostics.txt');
     expect(buildSpec.asString()).toContain('uname -srvm');
     expect(buildSpec.asString()).toContain('docker run --name tetragon -d');
+    expect(buildSpec.asString()).toContain('--entrypoint /usr/bin/tetragon');
+    expect(buildSpec.asString()).not.toContain('  /usr/bin/tetragon');
     expect(buildSpec.asString()).not.toContain('docker run --name tetragon --rm');
   });
 

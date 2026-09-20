@@ -27,10 +27,10 @@ docker run --name tetragon -d \
   --pid=host \
   --cgroupns=host \
   --privileged \
+  --entrypoint /usr/bin/tetragon \
   -v /sys/kernel/btf/vmlinux:/var/lib/tetragon/btf:ro \
   -v "${TETRAGON_ARTIFACT_DIR}:/var/log/tetragon" \
   "$TETRAGON_IMAGE" \
-  /usr/bin/tetragon \
   --export-filename /var/log/tetragon/tetragon.log \
   --enable-ancestors=base,kprobe > "${TETRAGON_ARTIFACT_DIR}/container-id" 2> "${TETRAGON_ARTIFACT_DIR}/startup-error.log"
 
