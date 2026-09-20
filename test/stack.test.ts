@@ -1,5 +1,5 @@
 import { App } from 'aws-cdk-lib';
-import { Match, Template } from 'aws-cdk-lib/assertions';
+import { Capture, Match, Template } from 'aws-cdk-lib/assertions';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -65,6 +65,17 @@ describe('TetragonCodeBuildGuardStack', () => {
         BuildSpec: Match.stringLikeRegexp('docker rm -f tetragon'),
       }),
     });
+  });
+
+  it('configures ancestor tracking with the CLI supported by Tetragon v1.7.0', () => {
+    const buildSpec = new Capture();
+    synthesizeTemplate().hasResourceProperties('AWS::CodeBuild::Project', {
+      Source: Match.objectLike({ BuildSpec: buildSpec }),
+    });
+
+    // v1.7.0 has no boolean ancestor flag; base enables kprobe reference counting.
+    expect(buildSpec.asString()).toContain('--enable-ancestors=base,kprobe');
+    expect(buildSpec.asString()).not.toContain('--enable-process-ancestors');
   });
 
   it('uses a CodeConnections ARN and grants only connection token access', () => {

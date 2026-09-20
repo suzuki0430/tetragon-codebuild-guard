@@ -26,7 +26,7 @@ docker run --name tetragon --rm -d \
   "$TETRAGON_IMAGE" \
   /usr/bin/tetragon \
   --export-filename /var/log/tetragon/tetragon.log \
-  --enable-process-ancestors > "${TETRAGON_ARTIFACT_DIR}/container-id" 2> "${TETRAGON_ARTIFACT_DIR}/startup-error.log"
+  --enable-ancestors=base,kprobe > "${TETRAGON_ARTIFACT_DIR}/container-id" 2> "${TETRAGON_ARTIFACT_DIR}/startup-error.log"
 
 if [ "$?" -ne 0 ]; then
   printf '%s\n' 'container-start-failed' > "$status_file"
