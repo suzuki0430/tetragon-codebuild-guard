@@ -1,91 +1,111 @@
 # tetragon-codebuild-guard
 
-AWS CodeBuild-hosted GitHub Actions runnerで実行中のプロセスをTetragonで観測し、
-侵害された依存パッケージによる外向き通信を検知・阻止するPoCです。
+Run GitHub Actions jobs on AWS CodeBuild and use Tetragon to observe and stop a
+simulated compromised npm dependency.
 
-TetragonはCVEを列挙する脆弱性スキャナーではありません。このプロジェクトでは、
-静的検査を通過したコードや依存関係がCIで不審な振る舞いをした場合に、eBPFを使った
-ランタイム観測・強制終了がどこまで有効かを検証します。
+Tetragon is a runtime security tool, not a CVE scanner. This proof of concept
+tests whether an eBPF-based policy can detect a connection from an npm
+`postinstall` script and terminate the process making it.
 
-> [!IMPORTANT]
-> AWS CodeBuildのマネージドカーネルで必要なeBPF/BTF機能が利用できるかを含めた
-> feasibility PoCです。リージョンやCodeBuildイメージの変更によってTetragonが起動
-> できない可能性があります。起動失敗時はGitHub jobを待機させ続けず、preflightで
-> 診断情報とともに失敗します。
+> **Note:** This is an experiment with eBPF and BTF support in CodeBuild's
+> managed environment, not a production security boundary. Availability can
+> vary with the host kernel and environment configuration. If Tetragon cannot
+> start, the workflow reports the failure and saves diagnostics.
 
-## 検証すること
+## What the demo tests
 
-同じ安全な攻撃シナリオを、次の3モードで実行します。
+The same simulated attack runs in three modes. Tetragon runs in all three.
 
-| モード     | TracingPolicy | npm lifecycle script | Canary受信 | 期待するTetragonイベント     |
-| ---------- | ------------- | -------------------- | ---------- | ---------------------------- |
-| `baseline` | 未適用        | 成功                 | あり       | `tcp_connect`なし            |
-| `observe`  | monitor       | 成功                 | あり       | 対象policyの接続イベントあり |
-| `enforce`  | enforce       | SIGKILLで失敗        | なし       | 対象policyの接続イベントあり |
+| Mode       | TracingPolicy | npm lifecycle script | Canary received | Expected demo policy events |
+| ---------- | ------------- | -------------------- | --------------- | --------------------------- |
+| `baseline` | Not loaded    | Succeeds             | Yes             | No connection events        |
+| `observe`  | Monitor       | Succeeds             | Yes             | Matching connection event   |
+| `enforce`  | Enforce       | Fails with SIGKILL   | No              | Matching connection event   |
 
-`demo/compromised-dependency`の`postinstall`は、固定文字列のcanaryを`curl`で送信します。
-送信先はCodeBuildコンテナ内で起動する一時HTTPサーバーです。実在する認証情報や
-インターネット上の収集先は使用しません。受信記録にはcanary自体ではなくSHA-256のみを
-保存します。
+The application in `demo/victim` depends on the local package in
+`demo/compromised-dependency`. Installing it with `npm ci` runs the dependency's
+`postinstall` script, which invokes `/usr/bin/curl` to send a fixed dummy value
+(the canary).
 
-## アーキテクチャ
+A temporary Node.js HTTP server in the same CodeBuild runner receives the
+request. The demo uses the runner's non-loopback IPv4 address so the connection
+matches the policy. It does not send data to an Internet collection endpoint,
+use real credentials, or test Internet exfiltration. The receipt stores the
+canary's SHA-256 hash, not its contents.
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    G[GitHub workflow_job] -->|queued webhook| C[AWS CodeBuild runner]
-    C -->|PRE_BUILD| T[Tetragon container]
-    C -->|BUILD| N[npm install]
-    N --> P[simulated postinstall]
-    P --> U[/usr/bin/curl]
-    T -->|observe| E[tetragon.log]
-    T -->|enforce| K[SIGKILL curl]
-    U -->|baseline / observe only| S[local canary sink]
-    E --> A[GitHub Actions artifact]
+    G["GitHub workflow_job"] -->|"queued webhook"| C["AWS CodeBuild runner"]
+    C -->|"PRE_BUILD"| T["Tetragon container"]
+    C -->|"BUILD"| N["npm ci"]
+    N --> P["simulated postinstall"]
+    P --> U["/usr/bin/curl"]
+    T -->|"observe"| E["tetragon.log"]
+    T -->|"enforce"| K["SIGKILL curl"]
+    U -->|"baseline / observe only"| S["local canary sink"]
+    E --> A["GitHub Actions artifact"]
 ```
 
-CodeBuildの`PRE_BUILD`でTetragonを起動し、GitHub Actions runnerが動く`BUILD`より先に
-観測を開始します。`POST_BUILD`ではデーモンログを回収してTetragonを停止します。
-この挙動を有効にするため、workflowのrunner labelには`buildspec-override:true`が必要です。
+CodeBuild starts Tetragon in `PRE_BUILD`, before the GitHub Actions runner starts
+in `BUILD`. In `POST_BUILD`, it collects daemon logs and stops Tetragon.
+The workflow needs the `buildspec-override:true` runner label to enable these
+buildspec phases.
 
-ビルドイメージとホストカーネルは別設定です。このStackでは、AL2023のビルドイメージに加えて
-`Environment.HostKernel: LINUX_KERNEL_6`を明示します。AL2023のイメージだけを選んでも
-Linux 4.14のホストで起動する場合があり、Tetragonが必要とするBTFを利用できません。
+The build image and host kernel are separate settings. This stack uses the
+Amazon Linux 2023 image and explicitly sets
+`Environment.HostKernel: LINUX_KERNEL_6`. Selecting the AL2023 image alone did
+not provide BTF in our initial run on a Linux 4.14 host. The successful run used
+Linux 6.1 with BTF available at `/sys/kernel/btf/vmlinux`; Linux 6.1 is the
+validated environment here, not Tetragon's minimum kernel requirement.
 
-## 作成されるAWSリソース
+Tetragon uses BTF type information to adapt its eBPF programs to the running
+kernel. This container-based setup also enables privileged mode so Tetragon
+can load and attach those programs.
 
-- CodeBuild project `tetragon-codebuild-guard`
-- CodeBuild用IAM role
-  - CloudWatch Logsへの書き込み
-  - 指定したCodeConnections connectionの読み取りだけ
-- CloudWatch Logs group `/aws/codebuild/tetragon-codebuild-guard`
-  - 保持期間7日
+See the [validation notes from September 20, 2026](docs/aws-validation-2026-09-20.md)
+(in Japanese) for the measured results and evidence links.
 
-VPC、NAT Gateway、EKS、S3 bucketは作成しません。
+## AWS resources
 
-## 前提条件
+The application stack creates:
 
-- AWSアカウントとデプロイ権限
-- Node.js 22以降
-- pnpm 10.11.0（`package.json`の`packageManager`と一致させる）
-- AWS CLI
-- GitHub repository
-- 対象リージョンで`CDK bootstrap`済みであること
-- GitHub App用AWS CodeConnections connectionが`AVAILABLE`であること
+- A CodeBuild project named `tetragon-codebuild-guard`.
+- A CodeBuild IAM role with access to write CloudWatch Logs and, when supplied,
+  use the specified CodeConnections connection.
+- A CloudWatch Logs group at `/aws/codebuild/tetragon-codebuild-guard`, with
+  seven-day retention.
 
-GitHub App connectionはAWSコンソールで認可の完了が必要です。接続方法は
-[AWS CodeBuild公式ドキュメント](https://docs.aws.amazon.com/codebuild/latest/userguide/connections-github-app.html)
-を参照してください。
+The application stack does not create a VPC, NAT Gateway, EKS cluster, or S3
+bucket. CDK bootstrapping creates its own supporting resources separately.
 
-## セットアップ
+## Prerequisites
 
-### 1. リポジトリをGitHubへpushする
+- An AWS account with permission to deploy the stack.
+- Node.js 22.12 or later.
+- pnpm 10.11.0, matching `packageManager` in `package.json`.
+- The AWS CLI, configured for the target account and Region.
+- A GitHub repository.
+- A bootstrapped CDK environment in the target account and Region, or permission
+  to bootstrap it in step 4.
+- An AWS CodeConnections connection for GitHub in the `AVAILABLE` state.
 
-このディレクトリを、実際にworkflowを実行するGitHub repositoryへpushします。
-`workflow_dispatch`だけを有効にしているため、pushや外部forkのPRでは自動実行されません。
+Complete GitHub App authorization in the AWS console. See the
+[AWS connection setup guide](https://docs.aws.amazon.com/codebuild/latest/userguide/connections-github-app.html).
 
-### 2. AWS CodeConnections connectionを作成する
+## Setup
 
-未作成の場合はconnectionを作成し、AWSコンソールでGitHub Appの認可を完了します。
+### 1. Push the repository to GitHub
+
+Push this project to the GitHub repository that will run the workflow.
+The demo only enables `workflow_dispatch`; pushes and pull requests from
+external forks do not automatically run it.
+
+### 2. Create the CodeConnections connection
+
+If you do not already have a connection, create one and complete the GitHub
+App setup in the AWS console:
 
 ```bash
 aws codeconnections create-connection \
@@ -93,17 +113,19 @@ aws codeconnections create-connection \
   --connection-name tetragon-codebuild-guard
 ```
 
-返されたARNを控えます。`PENDING`のままではデプロイ後のwebhook作成に失敗します。
+Save the returned ARN. A connection that is still `PENDING` cannot be used to
+create the repository webhook during deployment.
 
-GitHub Appの**認可（Authorize）とインストール（Install）は別の手順**です。
-`AVAILABLE`でもApp未インストールの場合、Webhookは作成できません。
+Authorizing the GitHub App and installing it are separate steps. An
+`AVAILABLE` connection alone does not prove the App has repository access.
 
-1. [AWS Connector for GitHub](https://github.com/apps/aws-connector-for-github)をインストールする。
-2. `Only select repositories`で検証用リポジトリだけを許可する。
-3. GitHubの`Settings > Applications > Installed GitHub Apps`にAppがあることを確認する。
-4. 接続の作成時は対象のApp installationを選択し、AWS側が`AVAILABLE`になったことを確認する。
+1. Install [AWS Connector for GitHub](https://github.com/apps/aws-connector-for-github).
+2. Choose `Only select repositories` and grant access to the demo repository.
+3. Check `Settings > Applications > Installed GitHub Apps` in GitHub.
+4. Select the correct App installation when completing the AWS connection setup,
+   and confirm that the connection is `AVAILABLE`.
 
-### 3. 依存関係とCDK templateを検証する
+### 3. Install dependencies and verify the project
 
 ```bash
 corepack enable
@@ -111,9 +133,13 @@ pnpm install --frozen-lockfile
 pnpm verify
 ```
 
-`pnpm verify`はformat、ESLint、TypeScript、単体テスト、CDK synthを順番に実行します。
+`pnpm verify` runs formatting checks, ESLint, TypeScript checks, unit tests, and
+CDK synthesis.
 
-### 4. AWSへデプロイする
+### 4. Deploy to AWS
+
+Skip the bootstrap command if the target account and Region are already
+bootstrapped.
 
 ```bash
 pnpm exec cdk bootstrap
@@ -124,35 +150,43 @@ pnpm exec cdk deploy \
   -c githubConnectionArn=YOUR_CONNECTION_ARN
 ```
 
-既にCodeBuildへGitHub credentialを登録している場合は`githubConnectionArn`を省略できます。
-ただし、新規構築ではGitHub App/CodeConnectionsの利用を推奨します。
+You can omit `githubConnectionArn` if suitable GitHub credentials are already
+registered with CodeBuild in the target account and Region. The instructions
+above use a GitHub App connection.
 
-デプロイ後、GitHub repositoryの`Settings > Webhooks`にCodeBuild webhookが作成され、
-`Workflow jobs`イベントが有効になっていることを確認します。
+After deployment, check that the repository's `Settings > Webhooks` contains
+the CodeBuild webhook with the `Workflow jobs` event enabled.
 
-### 5. 検証workflowを実行する
+### 5. Run the workflow
 
-GitHubのActions画面から`Tetragon CodeBuild Guard`を選び、`Run workflow`を実行します。
-GitHub CLIを使用する場合は次のコマンドでも開始できます。
+In GitHub Actions, select `Tetragon CodeBuild Guard` and choose `Run workflow`.
+Alternatively, use the GitHub CLI:
 
 ```bash
 gh workflow run tetragon-ci.yml
 ```
 
-3つのmatrix jobがそれぞれ一時CodeBuild runnerとして起動します。各jobのartifactには
-次の証跡が含まれます。
+Each of the three matrix jobs runs on its own temporary CodeBuild runner.
+All three jobs should pass: in `enforce`, the failed npm step is expected.
+The workflow uses `continue-on-error` for that step, then checks that the
+failure really was the expected policy enforcement.
 
-- `tetragon.log`: TetragonのNDJSONイベント
-- `summary.json`: secretを含まない集計結果
-- `tetragon-daemon.log`: Tetragonの起動・診断ログ
-- `kernel-diagnostics.txt`: 実際のカーネルバージョン、BTFの有無、Dockerのホスト情報
-- `tracing-policies.txt`: 適用されたpolicyとmode
-- `canary-server.log`: ローカル受信サーバーのログ
-- `attack-result.json`: curl子プロセスの終了コードとsignal
-- `canary-receipt.json`: 受信した場合のみ保存するcanaryのSHA-256
-- `result.json`: ポリシーの接続先、curl終了結果、受信有無を突き合わせた判定
+## Evidence
 
-`observe`の`summary.json`例:
+Each job uploads an artifact containing:
+
+- `tetragon.log`: Raw Tetragon events in NDJSON format.
+- `summary.json`: Aggregated event counts and destinations.
+- `tetragon-daemon.log`: Tetragon startup and diagnostic logs.
+- `kernel-diagnostics.txt`: Kernel version, BTF availability, and Docker host information.
+- `tracing-policies.txt`: Loaded policies and their modes.
+- `canary-server.log`: Local receiver logs.
+- `attack-result.json`: The curl child process's exit code and signal.
+- `canary-receipt.json`: The canary's SHA-256 hash, saved only if received.
+- `result.json`: The verdict based on the policy destination, curl exit result,
+  and receipt.
+
+Example `summary.json` for `observe` (counts and addresses vary by run):
 
 ```json
 {
@@ -170,89 +204,107 @@ gh workflow run tetragon-ci.yml
 }
 ```
 
-カーネルやTetragonのバージョンによって総イベント数やaction表現は変わる可能性があります。
-workflowの成否判定に使用するのは、対象policyの送信先に一致する接続イベント、npm stepの結果、
-curl子プロセスの実際のsignal、canary受信の有無です。単なる通信エラーはenforce成功とみなしません。
+Event counts and action reporting may differ across kernel and Tetragon
+versions. The workflow checks a policy event matching the receiver's address
+and port, the npm step's outcome, the curl child's actual signal, and whether
+the receiver saved a receipt. A generic network error does not count as
+successful enforcement.
 
-CodeBuild実測では、policyがカーネル内で`/usr/bin/curl`に一致していても、イベントの
-`process.binary`が欠け、`flags: unknown`になることがありました。これをcurl名で補完せず、
-`policyConnectMissingBinaryCount`として明示します。プロセスの親子関係まで取得できたとは主張しません。
+In the CodeBuild run, policy events could lack `process.binary` and contain
+`flags: unknown`, even though the kernel-side policy matched
+`/usr/bin/curl`. The analyzer reports this as
+`policyConnectMissingBinaryCount` rather than filling in the missing binary
+name. This experiment does not establish that process ancestry is available.
 
-またmonitorモードでもイベントのactionは`KPROBE_ACTION_SIGKILL`になり得ます。
-actionラベルだけで遮断と判定せず、`attack-result.json`の`signal: SIGKILL`と未受信を要求します。
-この区別のため、初期PoCの`enforcedCurlConnectCount`は`curlSigkillActionCount`へ改名しました。
+Monitor-mode events can also report `KPROBE_ACTION_SIGKILL` without killing
+the process. For enforcement, the assertion requires an actual
+`signal: SIGKILL` in `attack-result.json` and no receiver receipt. An action
+label alone is not evidence of blocking.
 
-## 実装のポイント
+## Implementation notes
 
-### Policy modeだけを切り替える
+### Switch modes, not policies
 
-`policies/block-curl-egress.yaml`には`Sigkill` actionがあります。`observe`では
-`tetra tracingpolicy add --mode monitor`としてロードするため、同じselectorでactionだけを
-無効化できます。`enforce`では`--mode enforce`を使用します。
+`policies/block-curl-egress.yaml` defines a `Sigkill` action. In `observe`,
+the workflow loads it with `tetra tracingpolicy add --mode monitor`, which
+keeps the selectors but disables enforcement. In `enforce`, it uses
+`--mode enforce`.
 
-### PRE_BUILDを意図的に失敗させない
+### Report startup failures from the GitHub job
 
-CodeBuild-hosted runnerでは、`PRE_BUILD`が失敗するとGitHub runnerが開始されず、GitHub jobを
-手動キャンセルする必要があります。そのためTetragonの起動結果を`startup-status`へ保存し、
-runner開始後の`Verify Tetragon startup` stepで明示的に検査します。
+If CodeBuild's `PRE_BUILD` phase fails, the GitHub runner does not start,
+which can leave the job waiting until it is canceled. The buildspec instead
+saves Tetragon's startup result to `startup-status`. Once the runner starts,
+the `Verify Tetragon startup` step checks that result and fails explicitly
+if needed.
 
-### 証跡にcanaryを残さない
+### Treat raw logs as sensitive
 
-Tetragonの生ログにはプロセス引数が含まれ得ます。`summary.json`生成時は接続先と件数だけを
-抽出します。実運用で生ログを保存する場合は、Tetragonのredaction設定、保存先の暗号化、
-アクセス制御、短い保持期間を追加してください。
+Raw Tetragon logs can include process arguments, including the demo's dummy
+canary value. The summary extracts counts and destinations, but that does not
+sanitize the raw logs uploaded alongside it. Before using this with real
+workloads, configure redaction, encryption, access controls, and short
+retention periods.
 
-## トラブルシューティング
+## Troubleshooting
 
 ### `btf-unavailable`
 
-CodeBuild環境で`/sys/kernel/btf/vmlinux`が公開されていません。まず
-`kernel-diagnostics.txt`とCodeBuild projectの`environment.hostKernel`を確認してください。
-`LINUX_KERNEL_6`が必要で、ビルドイメージだけを変更してもホストカーネルは変わりません。
-指定済みでもBTFがない場合は、診断ログを保存して対応環境を再検討してください。
+CodeBuild did not expose `/sys/kernel/btf/vmlinux`. Check
+`kernel-diagnostics.txt` and the project's `environment.hostKernel`.
+This stack explicitly selects `LINUX_KERNEL_6`; changing the build image
+alone does not change the host kernel. If BTF is still unavailable, retain
+the diagnostics and check whether the environment supports this setup.
 
 ### `container-start-failed`
 
-CodeBuild projectの`PrivilegedMode`、Docker daemon、Quayへの外向き通信を確認してください。
-`startup-error.log`とCloudWatch Logsに`docker info`の診断が出力されます。
+Check the CodeBuild project's privileged-mode setting, the Docker daemon,
+and network access to Quay. Inspect `startup-error.log` and the
+`docker info` diagnostics in CloudWatch Logs.
 
 ### `readiness-timeout`
 
-`tetragon-daemon.log`でBPF program、BTF、kernel capabilityのエラーを確認してください。
-起動に失敗したコンテナも`POST_BUILD`まで保持するため、終了理由を回収できます。
+Check `tetragon-daemon.log` for BPF program, BTF, or kernel capability errors.
+The buildspec retains a failed Tetragon container until `POST_BUILD` so its
+logs can be collected.
 
-### Webhook作成時の権限エラー
+### Permission errors when creating the webhook
 
-CodeConnectionsが`AVAILABLE`でも、GitHub Appが未インストール・対象リポジトリ未許可・
-追加Webhook権限の承認待ちの場合があります。GitHubの`Installed GitHub Apps`を確認し、
-必要ならAppの権限更新を承認してください。
-[AWS公式のトラブルシューティング](https://docs.aws.amazon.com/codebuild/latest/userguide/connections-github-app.html)
-も参照してください。
+Even with an `AVAILABLE` connection, the GitHub App may not be installed,
+may lack access to the repository, or may be waiting for approval of new
+webhook permissions. Check `Installed GitHub Apps` and approve any required
+permission updates. See the
+[AWS troubleshooting guide](https://docs.aws.amazon.com/codebuild/latest/userguide/connections-github-app.html).
 
-### GitHub jobがrunner待ちのままになる
+### The GitHub job keeps waiting for a runner
 
-- CodeBuild project名が`tetragon-codebuild-guard`か
-- workflow名が`Tetragon CodeBuild Guard`か
-- `runs-on`に`buildspec-override:true`があるか
-- CodeConnections connectionが`AVAILABLE`か
-- GitHub webhookに`Workflow jobs`イベントがあるか
+Check that:
 
-を確認してください。
+- The CodeBuild project is named `tetragon-codebuild-guard`.
+- The workflow is named `Tetragon CodeBuild Guard`.
+- `runs-on` includes `buildspec-override:true`.
+- The CodeConnections connection is `AVAILABLE`.
+- The GitHub webhook subscribes to `Workflow jobs`.
 
-## セキュリティ上の制限
+## Security limitations
 
-このプロジェクトは学習・検証用です。
+This project is for learning and experimentation.
 
-- CodeBuildはTetragon起動のためprivileged modeを使用します。
-- job自体も同じ特権環境にいるため、root相当の攻撃者はTetragon containerを停止できます。
-- `curl`全体を対象とする単純なpolicyで、汎用的なCI allowlistではありません。
-- Tetragon container imageはversion tagで固定していますが、digest固定ではありません。
-- public repositoryの外部PRや、信頼できないworkflowをこのrunnerで実行しないでください。
-- 実際のAWS credentialやGitHub tokenをcanaryとして使用しないでください。
+- CodeBuild and the Tetragon container run in privileged mode.
+- A job with root-equivalent access in the same environment can stop
+  Tetragon. It is not an independent security boundary against that job.
+- The policy targets `/usr/bin/curl` connections outside `127.0.0.0/8`.
+  It can block legitimate curl requests and does not cover every tool,
+  protocol, or exfiltration path.
+- The Tetragon image is pinned to a version tag, not an immutable digest.
+- Do not run untrusted workflows or external pull-request code on this runner.
+- Do not use real AWS credentials or GitHub tokens as the canary.
 
-詳細は[SECURITY.md](SECURITY.md)を参照してください。
+See [SECURITY.md](SECURITY.md) for additional notes (in Japanese).
 
-## 削除
+## Cleanup
+
+Save any evidence you want to keep, then remove the stack:
 
 ```bash
 pnpm exec cdk destroy \
@@ -261,10 +313,12 @@ pnpm exec cdk destroy \
   -c githubConnectionArn=YOUR_CONNECTION_ARN
 ```
 
-Stackを削除するとCodeBuild project、IAM role、CloudWatch Logs groupを削除します。
-CodeConnections connectionはこのStackの管理外なので、不要なら別途削除してください。
+This deletes the CodeBuild project, its IAM role, and the CloudWatch Logs
+group, including its logs. The CodeConnections connection is managed outside
+this stack; remove it separately if it is no longer needed. CDK bootstrap
+resources are also outside this application stack.
 
-## ディレクトリ構成
+## Repository layout
 
 ```text
 .
@@ -273,7 +327,7 @@ CodeConnections connectionはこのStackの管理外なので、不要なら別�
 ├── demo/
 │   ├── compromised-dependency/
 │   └── victim/
-├── docs/article-outline.md
+├── docs/aws-validation-2026-09-20.md
 ├── lib/
 │   ├── codebuild-runner-buildspec.ts
 │   └── tetragon-codebuild-guard-stack.ts
@@ -282,14 +336,16 @@ CodeConnections connectionはこのStackの管理外なので、不要なら別�
 │   ├── analyze-events.mjs
 │   ├── assert-demo-result.mjs
 │   ├── canary-server.mjs
+│   ├── local-ipv4.mjs
 │   └── tetragon-guard.sh
 └── test/
 ```
 
-## 参考資料
+## References
 
-- [CodeBuild-hosted GitHub Actions runner](https://docs.aws.amazon.com/codebuild/latest/userguide/action-runner.html)
-- [Tetragonをコンテナとして実行する](https://tetragon.io/docs/installation/container/)
+- [CodeBuild-hosted GitHub Actions runners](https://docs.aws.amazon.com/codebuild/latest/userguide/action-runner.html)
+- [Run Tetragon in Docker](https://tetragon.io/docs/getting-started/install-docker/)
+- [Tetragon prerequisites and BTF](https://tetragon.io/docs/installation/faq/)
 - [Tetragon TracingPolicy](https://tetragon.io/docs/concepts/tracing-policy/)
 - [Tetragon Enforcement Mode](https://tetragon.io/docs/concepts/tracing-policy/mode/)
 - [Tetragon Policy Enforcement](https://tetragon.io/docs/getting-started/enforcement/)
